@@ -156,11 +156,24 @@ def fix_doc_defaults_font_size(doc):
 
 
 def set_math_default_left(doc) -> bool:
-    """将 word/settings.xml 中的全局公式默认对齐 (<m:defJc>) 设为 left。"""
+    """确保 word/settings.xml 存在 <m:mathPr><m:defJc m:val='left'/></m:mathPr>。"""
     settings_el = doc.settings.element
     math_pr = settings_el.find(m_qn("mathPr"))
     if math_pr is None:
-        return False
+        math_pr = settings_el.makeelement(m_qn("mathPr"))
+        # 按 w:settings 常见位置插在 themeFontLang / clrSchemeMapping / decimalSymbol 之前
+        before_tags = {
+            qn("w:themeFontLang"),
+            qn("w:clrSchemeMapping"),
+            qn("w:decimalSymbol"),
+            qn("w:listSeparator"),
+        }
+        insert_idx = len(settings_el)
+        for idx, child in enumerate(settings_el):
+            if child.tag in before_tags:
+                insert_idx = idx
+                break
+        settings_el.insert(insert_idx, math_pr)
 
     def_jc = math_pr.find(m_qn("defJc"))
     if def_jc is not None:
@@ -187,6 +200,31 @@ def set_math_default_left(doc) -> bool:
             break
     math_pr.insert(insert_idx, def_jc)
     return True
+
+
+def fix_numbering_alignment(doc) -> int:
+    """修正 numbering.xml 中编号层级可能自带的居中/右对齐/两端对齐。"""
+    fixed = 0
+    try:
+        numbering_part = doc.part.numbering_part
+    except Exception:
+        return 0
+    if numbering_part is None:
+        return 0
+
+    numbering_el = numbering_part.element
+    for lvl in numbering_el.iter(qn("w:lvl")):
+        lvl_jc = lvl.find(qn("w:lvlJc"))
+        if lvl_jc is not None and lvl_jc.get(qn("w:val")) in ("center", "right", "both"):
+            lvl_jc.set(qn("w:val"), "left")
+            fixed += 1
+        pPr = lvl.find(qn("w:pPr"))
+        if pPr is not None:
+            for jc in pPr.findall(qn("w:jc")):
+                if jc.get(qn("w:val")) != "left":
+                    jc.set(qn("w:val"), "left")
+                    fixed += 1
+    return fixed
 
 
 def get_style_font_size_pt(style):
@@ -268,6 +306,93 @@ def has_math_content(paragraph) -> bool:
     for _ in paragraph._p.iter(m_qn("oMath")):
         return True
     return False
+
+
+def ensure_bare_math_inline(paragraph) -> int:
+    """
+    防止 Word / LibreOffice 把“独占一行的 <m:oMath>”自动当成居中展示公式：
+    若某一行（<w:br/> 之间）只有 <m:oMath> 而无非空白文本，则在该 <m:oMath> 前插入一个
+    1 磅极小宽度的不间断空格 (\u00a0) Run（所有字体均支持，不会出现方框，打印完全不可见）。
+    """
+    p_el = paragraph._p
+
+    # 兼容清理：若存在旧版插入的 \u200b，自动替换为 1 磅的 \u00a0
+    for r_el in p_el.findall(qn("w:r")):
+        for t_el in r_el.findall(qn("w:t")):
+            if t_el.text and "\u200b" in t_el.text:
+                t_el.text = t_el.text.replace("\u200b", "\u00a0")
+                rPr = r_el.find(qn("w:rPr"))
+                if rPr is None:
+                    rPr = r_el.makeelement(qn("w:rPr"))
+                    r_el.insert(0, rPr)
+                for tag in ("w:sz", "w:szCs"):
+                    sz = rPr.find(qn(tag))
+                    if sz is None:
+                        sz = rPr.makeelement(qn(tag))
+                        rPr.append(sz)
+                    sz.set(qn("w:val"), "2")
+
+    children = list(p_el)
+
+    # 先按 <w:br/> / <w:cr/> 将子节点分成若干逻辑行，检查每个直接子 <m:oMath> 所在行是否有可见文本
+    lines = [[]]
+    for child in children:
+        if child.tag == qn("w:pPr"):
+            continue
+        lines[-1].append(child)
+        if child.tag == qn("w:r"):
+            # 如果这个 <w:r> 里包含换行符，则切分逻辑行
+            has_br = any(sub.tag in (qn("w:br"), qn("w:cr")) for sub in child)
+            if has_br:
+                lines.append([])
+
+    def line_has_visible_text(line_nodes) -> bool:
+        for node in line_nodes:
+            if node.tag == qn("w:r"):
+                for sub in node:
+                    if sub.tag == qn("w:t") and sub.text and (sub.text.strip() or "\u00a0" in sub.text):
+                        return True
+        return False
+
+    inserted = 0
+    for line_nodes in lines:
+        if not line_nodes or line_has_visible_text(line_nodes):
+            continue
+        # 该行没有普通文本，检查是否有直接的 <m:oMath>
+        for node in line_nodes:
+            if node.tag == m_qn("oMath"):
+                nbsp_run = p_el.makeelement(qn("w:r"))
+                rPr = nbsp_run.makeelement(qn("w:rPr"))
+                rFonts = rPr.makeelement(qn("w:rFonts"))
+                rFonts.set(qn("w:ascii"), "Arial")
+                rFonts.set(qn("w:hAnsi"), "Arial")
+                rFonts.set(qn("w:cs"), "Arial")
+                rPr.append(rFonts)
+                for tag in ("w:sz", "w:szCs"):
+                    sz = rPr.makeelement(qn(tag))
+                    sz.set(qn("w:val"), "2")  # 1 磅极小宽度，打印完全不可见
+                    rPr.append(sz)
+                nbsp_run.append(rPr)
+
+                t_el = nbsp_run.makeelement(qn("w:t"))
+                t_el.text = "\u00a0"
+                nbsp_run.append(t_el)
+
+                idx = list(p_el).index(node)
+                p_el.insert(idx, nbsp_run)
+                inserted += 1
+                break  # 每行只需要在第一个 <m:oMath> 前插入一次即可
+
+    return inserted
+
+
+def force_paragraph_left(paragraph):
+    """清除 pPr 中所有旧 w:jc 并显式设为 left。"""
+    pPr = paragraph._p.pPr
+    if pPr is not None:
+        for old_jc in pPr.findall(qn("w:jc")):
+            pPr.remove(old_jc)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
 def clear_positive_indents(paragraph):
@@ -357,11 +482,12 @@ def process_paragraph(paragraph, doc, stats, align_body=True):
 
         # 所有列表项、含公式的段落、以及两端对齐段落，统一改为左对齐
         if is_list or has_math or is_justify:
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            force_paragraph_left(paragraph)
             if is_list:
                 stats["left_aligned_lists"] += 1
             if has_math:
                 stats["left_aligned_math_paras"] += 1
+                stats["inline_math_guards"] += ensure_bare_math_inline(paragraph)
                 if not is_list:
                     clear_positive_indents(paragraph)
 
@@ -461,8 +587,10 @@ def format_docx_document(doc: Document, output_path: Path):
         "resized_styles": 0,
         "left_aligned_lists": 0,
         "left_aligned_math_paras": 0,
+        "inline_math_guards": 0,
         "omath_nodes": 0,
         "omath_para_blocks": 0,
+        "numbering_fixed": 0,
         "default_changed": False,
         "math_def_changed": False,
     }
@@ -477,6 +605,7 @@ def format_docx_document(doc: Document, output_path: Path):
     stats["omath_para_blocks"] = align_all_omath_para_left(doc.element.body)
     stats["resized_math_sz"] = resize_math_fonts(doc.element.body)
     stats["math_def_changed"] = set_math_default_left(doc)
+    stats["numbering_fixed"] = fix_numbering_alignment(doc)
 
     # 3. 处理页眉和页脚中已有段落
     for section in doc.sections:
@@ -508,7 +637,7 @@ def format_docx_document(doc: Document, output_path: Path):
         f"统计信息:\n"
         f"  - 共调整段落: {stats['paragraphs']} 个\n"
         f"  - 设为左对齐的列表项: {stats['left_aligned_lists']} 个，含公式段落: {stats['left_aligned_math_paras']} 个\n"
-        f"  - 检测到公式节点 (<m:oMath>): {stats['omath_nodes']} 个，其中独立公式块 (<m:oMathPara>): {stats['omath_para_blocks']} 个（均已设为左对齐）\n"
+        f"  - 防自动居中锁左处理的独行公式: {stats['inline_math_guards']} 行，独立公式块 (<m:oMathPara>): {stats['omath_para_blocks']} 个（总计 <m:oMath> {stats['omath_nodes']} 个）\n"
         f"  - 压缩至五号的文本: {stats['resized_runs']} 处，公式字号: {stats['resized_math_sz']} 处，样式: {stats['resized_styles']} 个"
         f"{'，文档默认字号已同步调整' if stats['default_changed'] else ''}"
         f"{'，全局公式默认对齐已设为left' if stats['math_def_changed'] else ''}\n"

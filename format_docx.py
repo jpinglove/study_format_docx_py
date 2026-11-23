@@ -1,5 +1,9 @@
+import sys
 import argparse
+import subprocess
+import tempfile
 from pathlib import Path
+from lxml import etree
 from docx import Document
 from docx.shared import Pt
 from docx.text.paragraph import Paragraph
@@ -11,6 +15,8 @@ from docx.oxml.ns import qn
 WUHAO_PT = 10.5
 WUHAO_HALF_PT = 21
 
+# 改用纯大写字母和数字，绝不会触发 Markdown 的下划线/星号等格式解析
+TAB_PLACEHOLDER = "XTABCHAR999X"
 
 # 用法
 # '''
@@ -39,6 +45,71 @@ LITERAL_BULLET_PREFIXES = (
 def m_qn(tag: str) -> str:
     return f"{{{MATH_NS}}}{tag}"
 
+
+# ==========================================
+# 第一部分：Markdown 占位符与 Pandoc 转换
+# ==========================================
+
+def replace_in_paragraph(paragraph):
+    """支持跨 Run 的精准替换，防止 Word 拆分文本碎片导致替换失败"""
+    if TAB_PLACEHOLDER not in paragraph.text:
+        return
+
+    while TAB_PLACEHOLDER in paragraph.text:
+        full_text = paragraph.text
+        start_idx = full_text.find(TAB_PLACEHOLDER)
+        end_idx = start_idx + len(TAB_PLACEHOLDER)
+
+        current_pos = 0
+        for run in paragraph.runs:
+            run_len = len(run.text)
+            run_start = current_pos
+            run_end = current_pos + run_len
+
+            if run_end > start_idx and run_start < end_idx:
+                overlap_start = max(start_idx, run_start) - run_start
+                overlap_end = min(end_idx, run_end) - run_start
+
+                if run_start <= start_idx < run_end:
+                    run.text = run.text[:overlap_start] + "\t" + run.text[overlap_end:]
+                else:
+                    run.text = run.text[:overlap_start] + run.text[overlap_end:]
+
+            current_pos += run_len
+
+
+def replace_placeholder_with_tab(doc: Document):
+    """遍历 Word 文档 XML 树中的所有段落，还原制表符"""
+    for p_el in doc.element.body.iter(qn("w:p")):
+        paragraph = Paragraph(p_el, doc._body)
+        replace_in_paragraph(paragraph)
+
+
+def run_pandoc_to_docx(md_path: Path, raw_docx_path: Path, with_toc: bool = True):
+    """将全角空格替换为占位符后，调用 pandoc 转为临时 docx"""
+    content = md_path.read_text(encoding="utf-8")
+    processed_content = content.replace("\u3000", TAB_PLACEHOLDER)
+
+    tmp_md_path = raw_docx_path.with_name("source_processed.md")
+    tmp_md_path.write_text(processed_content, encoding="utf-8")
+
+    cmd = [
+        "pandoc",
+        str(tmp_md_path),
+        "-f", "markdown+hard_line_breaks+tex_math_dollars+tex_math_single_backslash+pipe_tables+grid_tables",
+        "--highlight-style=tango",
+    ]
+    if with_toc:
+        cmd.extend(["--toc", "--toc-depth=3"])
+    cmd.extend(["-o", str(raw_docx_path)])
+
+    print(f"正在通过 Pandoc 转换: {md_path.name} -> {raw_docx_path.name} ...")
+    subprocess.run(cmd, check=True)
+
+
+# ==========================================
+# 第二部分：DOCX 排版、字号、对齐与页码处理
+# ==========================================
 
 def get_doc_default_font_size_pt(doc):
     """读取文档 docDefaults 中的默认字号（单位：磅）。"""
@@ -82,11 +153,24 @@ def fix_doc_defaults_font_size(doc):
 
 
 def set_math_default_left(doc) -> bool:
-    """将 word/settings.xml 中的全局公式默认对齐 (<m:defJc>) 设为 left。"""
+    """确保 word/settings.xml 存在 <m:mathPr><m:defJc m:val='left'/></m:mathPr>。"""
     settings_el = doc.settings.element
     math_pr = settings_el.find(m_qn("mathPr"))
+
     if math_pr is None:
-        return False
+        math_pr = settings_el.makeelement(m_qn("mathPr"))
+        before_tags = {
+            qn("w:themeFontLang"),
+            qn("w:clrSchemeMapping"),
+            qn("w:decimalSymbol"),
+            qn("w:listSeparator"),
+        }
+        insert_idx = len(settings_el)
+        for idx, child in enumerate(settings_el):
+            if child.tag in before_tags:
+                insert_idx = idx
+                break
+        settings_el.insert(insert_idx, math_pr)
 
     def_jc = math_pr.find(m_qn("defJc"))
     if def_jc is not None:
@@ -114,6 +198,31 @@ def set_math_default_left(doc) -> bool:
             break
     math_pr.insert(insert_idx, def_jc)
     return True
+
+
+def fix_numbering_alignment(doc) -> int:
+    """修正 numbering.xml 中编号层级可能自带的居中/右对齐/两端对齐。"""
+    fixed = 0
+    try:
+        numbering_part = doc.part.numbering_part
+    except Exception:
+        return 0
+    if numbering_part is None:
+        return 0
+
+    numbering_el = numbering_part.element
+    for lvl in numbering_el.iter(qn("w:lvl")):
+        lvl_jc = lvl.find(qn("w:lvlJc"))
+        if lvl_jc is not None and lvl_jc.get(qn("w:val")) in ("center", "right", "both"):
+            lvl_jc.set(qn("w:val"), "left")
+            fixed += 1
+        pPr = lvl.find(qn("w:pPr"))
+        if pPr is not None:
+            for jc in pPr.findall(qn("w:jc")):
+                if jc.get(qn("w:val")) != "left":
+                    jc.set(qn("w:val"), "left")
+                    fixed += 1
+    return fixed
 
 
 def get_style_font_size_pt(style):
@@ -196,6 +305,72 @@ def has_math_content(paragraph) -> bool:
     for _ in paragraph._p.iter(m_qn("oMath")):
         return True
     return False
+
+
+def ensure_bare_math_inline(paragraph) -> int:
+    """
+    防止 Word / LibreOffice 把“独占一行的 <m:oMath>”自动当成居中展示公式：
+    若某一行（<w:br/> 之间）只有 <m:oMath> 而无非空白文本，则在该 <m:oMath> 前插入零宽空格 (\u200b) Run。
+    """
+    p_el = paragraph._p
+    children = list(p_el)
+
+    # 先按 <w:br/> / <w:cr/> 将子节点分成若干逻辑行，检查每个直接子 <m:oMath> 所在行是否有可见文本
+    lines = [[]]
+    for child in children:
+        if child.tag == qn("w:pPr"):
+            continue
+        lines[-1].append(child)
+        if child.tag == qn("w:r"):
+            # 如果这个 <w:r> 里包含换行符，则切分逻辑行
+            has_br = any(sub.tag in (qn("w:br"), qn("w:cr")) for sub in child)
+            if has_br:
+                lines.append([])
+
+    def line_has_visible_text(line_nodes) -> bool:
+        for node in line_nodes:
+            if node.tag == qn("w:r"):
+                for sub in node:
+                    if sub.tag == qn("w:t") and sub.text and sub.text.strip():
+                        return True
+        return False
+
+    inserted = 0
+    for line_nodes in lines:
+        if not line_nodes or line_has_visible_text(line_nodes):
+            continue
+        # 该行没有普通文本，检查是否有直接的 <m:oMath>
+        for node in line_nodes:
+            if node.tag == m_qn("oMath"):
+                zwsp_run = p_el.makeelement(qn("w:r"))
+                rPr = zwsp_run.makeelement(qn("w:rPr"))
+                sz = rPr.makeelement(qn("w:sz"))
+                sz.set(qn("w:val"), str(WUHAO_HALF_PT))
+                szCs = rPr.makeelement(qn("w:szCs"))
+                szCs.set(qn("w:val"), str(WUHAO_HALF_PT))
+                rPr.append(sz)
+                rPr.append(szCs)
+                zwsp_run.append(rPr)
+
+                t_el = zwsp_run.makeelement(qn("w:t"))
+                t_el.text = "\u200b"
+                zwsp_run.append(t_el)
+
+                idx = list(p_el).index(node)
+                p_el.insert(idx, zwsp_run)
+                inserted += 1
+                break  # 每行只需要在第一个 <m:oMath> 前插入一次即可
+
+    return inserted
+
+
+def force_paragraph_left(paragraph):
+    """清除 pPr 中所有旧 w:jc 并显式设为 left。"""
+    pPr = paragraph._p.pPr
+    if pPr is not None:
+        for old_jc in pPr.findall(qn("w:jc")):
+            pPr.remove(old_jc)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
 def clear_positive_indents(paragraph):
@@ -286,12 +461,12 @@ def process_paragraph(paragraph, doc, stats, align_body=True):
 
         # 所有列表项、含公式的段落、以及默认两端对齐的段落，统一改为左对齐
         if is_list or has_math or is_justify:
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            force_paragraph_left(paragraph)
             if is_list:
                 stats["left_aligned_lists"] += 1
             if has_math:
                 stats["left_aligned_math_paras"] += 1
-                # 非列表项的独立公式段落，顺便清掉可能存在的多余缩进
+                stats["inline_math_guards"] += ensure_bare_math_inline(paragraph)
                 if not is_list:
                     clear_positive_indents(paragraph)
 
@@ -390,8 +565,8 @@ def add_footer_page_numbers(doc):
                 add_page_number_to_footer(section.even_page_footer)
 
 
-def process_docx(input_path: Path, output_path: Path):
-    doc = Document(str(input_path))
+def format_docx_document(doc: Document, output_path: Path):
+    """对已加载的 Document 对象执行全部格式化并保存。"""
     stats = {
         "paragraphs": 0,
         "resized_runs": 0,
@@ -399,8 +574,10 @@ def process_docx(input_path: Path, output_path: Path):
         "resized_styles": 0,
         "left_aligned_lists": 0,
         "left_aligned_math_paras": 0,
+        "inline_math_guards": 0,
         "omath_nodes": 0,
         "omath_para_blocks": 0,
+        "numbering_fixed": 0,
         "default_changed": False,
         "math_def_changed": False,
     }
@@ -415,6 +592,7 @@ def process_docx(input_path: Path, output_path: Path):
     stats["omath_para_blocks"] = align_all_omath_para_left(doc.element.body)
     stats["resized_math_sz"] = resize_math_fonts(doc.element.body)
     stats["math_def_changed"] = set_math_default_left(doc)
+    stats["numbering_fixed"] = fix_numbering_alignment(doc)
 
     # 3. 处理页眉和页脚中已有段落与公式块
     for section in doc.sections:
@@ -439,13 +617,14 @@ def process_docx(input_path: Path, output_path: Path):
     # 3. 在页脚中间添加 "1/4" 格式页码
     add_footer_page_numbers(doc)
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
-    print(f"处理完成！已保存至: {output_path}")
+    print(f"处理完成！最终文件已保存至: {output_path}")
     print(
         f"统计信息:\n"
         f"  - 共调整段落: {stats['paragraphs']} 个\n"
         f"  - 设为左对齐的列表项: {stats['left_aligned_lists']} 个，含公式段落: {stats['left_aligned_math_paras']} 个\n"
-        f"  - 检测到公式节点 (<m:oMath>): {stats['omath_nodes']} 个，其中独立公式块 (<m:oMathPara>): {stats['omath_para_blocks']} 个（均已设为左对齐）\n"
+        f"  - 防自动居中锁左处理的独行公式: {stats['inline_math_guards']} 行，独立公式块 (<m:oMathPara>): {stats['omath_para_blocks']} 个（总计 <m:oMath> {stats['omath_nodes']} 个）\n"
         f"  - 压缩至五号的文本: {stats['resized_runs']} 处，公式字号: {stats['resized_math_sz']} 处，样式: {stats['resized_styles']} 个"
         f"{'，文档默认字号已同步调整' if stats['default_changed'] else ''}"
         f"{'，全局公式默认对齐已设为left' if stats['math_def_changed'] else ''}\n"
@@ -453,42 +632,79 @@ def process_docx(input_path: Path, output_path: Path):
     )
 
 
+def convert_and_format(input_path: Path, output_path: Path, with_toc: bool = True):
+    """自动识别输入类型：Markdown 先转 docx 再排版；docx 直接排版。"""
+    if input_path.suffix.lower() == ".docx":
+        doc = Document(str(input_path))
+        format_docx_document(doc, output_path)
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        raw_docx_path = Path(tmp_dir) / "raw.docx"
+        run_pandoc_to_docx(input_path, raw_docx_path, with_toc=with_toc)
+        doc = Document(str(raw_docx_path))
+        replace_placeholder_with_tab(doc)
+        format_docx_document(doc, output_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="调整 Word (.docx) 文档行距(最小11磅)、段间距(1磅)、字号(大于五号改五号)、列表与公式左对齐并添加 1/4 格式页码。"
+        description="将 Markdown (.md) 转为 Word (.docx) 并自动完成行距(最小11磅)、段间距(1磅)、字号(<=五号)、列表与公式左对齐及页脚 1/4 页码排版（也支持直接输入 .docx）。"
     )
     parser.add_argument(
-        "docx_path",
-        help="Word 文档路径（支持绝对路径或相对路径）",
+        "input_path",
+        help="输入文件路径（.md 或 .docx，支持绝对路径或相对路径；若无后缀默认按 .md 处理）",
     )
     parser.add_argument(
         "-o",
         "--output",
-        help="输出文件路径（默认生成在原文件同目录下，后缀为 _adjusted.docx）",
+        help="输出 .docx 路径（默认：.md 输入生成同名 .docx；.docx 输入生成 原名_adjusted.docx）",
     )
     parser.add_argument(
         "-i",
         "--inplace",
         action="store_true",
-        help="直接覆盖原文件",
+        help="当输入为 .docx 时直接覆盖原文件",
+    )
+    parser.add_argument(
+        "--no-toc",
+        action="store_true",
+        help="转换 Markdown 时不生成目录 (--toc)",
     )
 
     args = parser.parse_args()
-    input_path = Path(args.docx_path).expanduser().resolve()
+    input_path = Path(args.input_path).expanduser()
+    if not input_path.suffix:
+        input_path = input_path.with_suffix(".md")
+    input_path = input_path.resolve()
 
     if not input_path.exists() or not input_path.is_file():
-        raise FileNotFoundError(f"找不到文件: {input_path}")
-    if input_path.suffix.lower() != ".docx":
-        raise ValueError(f"仅支持 .docx 文件，当前文件为: {input_path.name}")
+        print(f"错误：找不到文件 -> {input_path}")
+        sys.exit(1)
 
-    if args.inplace:
-        output_path = input_path
-    elif args.output:
+    suffix = input_path.suffix.lower()
+    if suffix not in (".md", ".markdown", ".docx"):
+        print(f"错误：仅支持 .md / .markdown / .docx 文件，当前为: {input_path.name}")
+        sys.exit(1)
+
+    if args.output:
         output_path = Path(args.output).expanduser().resolve()
+    elif suffix == ".docx":
+        output_path = input_path if args.inplace else input_path.with_name(f"{input_path.stem}_adjusted.docx")
     else:
-        output_path = input_path.with_name(f"{input_path.stem}_adjusted.docx")
+        output_path = input_path.with_suffix(".docx")
 
-    process_docx(input_path, output_path)
+    try:
+        convert_and_format(input_path, output_path, with_toc=not args.no_toc)
+    except subprocess.CalledProcessError as e:
+        print(f"Pandoc 执行失败，错误码: {e.returncode}")
+        sys.exit(e.returncode)
+    except FileNotFoundError as e:
+        if "pandoc" in str(e).lower():
+            print("错误：未找到 pandoc 命令，请确认已安装 Pandoc 并添加到环境变量 PATH 中。")
+        else:
+            print(f"错误：{e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
