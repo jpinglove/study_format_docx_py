@@ -227,3 +227,41 @@ __marimo__/
 .md
 .pdf
 
+
+
+# === Poetry 虚拟环境 ===
+.venv/
+venv/
+env/
+
+# === Python 缓存与编译文件 ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# === 打包与分发产物 ===
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# === 测试与代码检查缓存 ===
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# === 环境变量与本地配置 ===
+.env
+.env.local
+
+# === 编辑器与系统文件 ===
+.vscode/
+.idea/
+.DS_Store
+
+
+
